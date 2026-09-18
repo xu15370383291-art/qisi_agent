@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>启思学伴 · 管理员登录</title>
+  <link rel="stylesheet" href="/static/styles.css?v=visual-refresh-1" />
+  <style>
+    .admin-login-screen { min-height:100vh; display:grid; place-items:center; padding:24px; background:var(--paper); }
+    .admin-login-panel { width:min(430px,100%); background:var(--panel); border:1px solid var(--line); box-shadow:var(--shadow); padding:38px; }
+    .admin-login-brand { display:flex; align-items:center; gap:12px; }
+    .admin-login-brand .brand-symbol { width:40px; height:40px; display:grid; place-items:center; background:var(--ink); color:#fff; font-weight:800; }
+    .admin-login-brand strong, .admin-login-brand small { display:block; }
+    .admin-login-brand small { margin-top:3px; color:var(--muted); font-size:11px; }
+    .admin-login-heading { margin:42px 0 25px; }
+    .admin-login-heading h1 { margin:8px 0; font-size:28px; }
+    .admin-login-heading p { margin:0; color:var(--muted); font-size:13px; line-height:1.7; }
+    .admin-login-form { display:grid; gap:16px; }
+    .admin-login-form label { display:grid; gap:7px; color:var(--ink); font-size:12px; font-weight:700; }
+    .admin-login-form input { border:1px solid var(--line); padding:11px 12px; color:var(--ink); outline:0; font:inherit; background:#fff; }
+    .admin-login-form input:focus { border-color:var(--teal); }
+    .admin-register-only { display:none !important; }
+    .admin-register-only.visible { display:grid !important; }
+    .admin-login-submit { border:0; background:var(--coral); color:#fff; padding:12px; font-weight:700; cursor:pointer; }
+    .admin-login-submit:hover { background:#d95342; }
+    .admin-login-submit:disabled { opacity:.65; cursor:wait; }
+    .admin-login-error { min-height:18px; margin:0; color:#b34d40; font-size:12px; }
+    .admin-login-footer { display:flex; justify-content:space-between; gap:12px; margin-top:24px; color:var(--muted); font-size:11px; }
+    .admin-login-footer a { color:var(--teal); text-decoration:none; }
+  </style>
+</head>
+<body>
+  <main class="admin-login-screen">
+    <section class="admin-login-panel" aria-labelledby="admin-login-title">
+      <div class="admin-login-brand"><span class="brand-symbol">启</span><div><strong>启思学伴</strong><small>管理员控制台</small></div></div>
+      <div class="admin-login-heading"><span class="section-label">ADMIN ACCESS</span><h1 id="admin-login-title">管理员登录</h1><p id="admin-login-copy">此入口仅用于系统管理。学生和教师账号不能从这里登录。</p></div>
+      <form id="admin-login-form" class="admin-login-form">
+        <label>管理员账号<input id="admin-username" name="username" autocomplete="username" required minlength="3" maxlength="64" /></label>
+        <label>管理员密码<input id="admin-password" name="password" type="password" autocomplete="current-password" required minlength="6" maxlength="128" /></label>
+        <label id="admin-display-wrap" class="admin-register-only">显示名称<input id="admin-display-name" name="display_name" maxlength="80" /></label>
+        <label id="admin-code-wrap" class="admin-register-only">管理员申请码<input id="admin-application-code" name="application_code" type="password" autocomplete="off" required minlength="1" maxlength="64" /></label>
+        <p id="admin-login-error" class="admin-login-error" role="alert"></p>
+        <button id="admin-login-submit" class="admin-login-submit" type="submit">登录管理后台</button>
+      </form>
+      <div class="admin-login-footer"><button id="admin-mode-switch" type="button" style="border:0;background:transparent;color:var(--teal);padding:0;cursor:pointer;font:inherit;">申请管理员账号</button><a href="/">返回学习空间</a></div>
+    </section>
+  </main>
+  <script>
+    const $ = (selector) => document.querySelector(selector);
+    const form = $('#admin-login-form');
+    const error = $('#admin-login-error');
+    const submit = $('#admin-login-submit');
+    const modeSwitch = $('#admin-mode-switch');
+    let registerMode = false;
+    const existingToken = localStorage.getItem('qisi_access_token');
+
+    function setMode(register) {
+      registerMode = register;
+      $('#admin-login-title').textContent = register ? '申请管理员账号' : '管理员登录';
+      $('#admin-login-copy').textContent = register ? '填写申请码后创建管理员账号。申请码由系统负责人发放。' : '此入口仅用于系统管理。学生和教师账号不能从这里登录。';
+      $('#admin-display-wrap').classList.toggle('visible', register);
+      $('#admin-code-wrap').classList.toggle('visible', register);
+      $('#admin-application-code').required = register;
+      submit.textContent = register ? '提交申请并进入后台' : '登录管理后台';
+      modeSwitch.textContent = register ? '已有管理员账号？返回登录' : '申请管理员账号';
+      error.textContent = '';
+    }
+
+    async function checkExistingSession() {
+      if (!existingToken) return;
+      try {
+        const response = await fetch('/api/auth/me', { headers: { Authorization: `Bearer ${existingToken}` } });
+        const user = await response.json();
+        if (response.ok && user.role === 'admin') window.location.replace('/admin');
+      } catch (_) {
+        localStorage.removeItem('qisi_access_token');
+      }
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      error.textContent = '';
+      submit.disabled = true;
+      try {
+        const response = await fetch(registerMode ? '/api/auth/admin-register' : '/api/auth/login', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: registerMode
+            ? JSON.stringify({ username: $('#admin-username').value.trim(), password: $('#admin-password').value, display_name: $('#admin-display-name').value.trim(), application_code: $('#admin-application-code').value })
+            : JSON.stringify({ username: $('#admin-username').value.trim(), password: $('#admin-password').value, role: 'admin' })
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.detail || (registerMode ? '管理员申请失败' : '管理员登录失败'));
+        if (!data.user || data.user.role !== 'admin') throw new Error('该账号不是管理员账号');
+        localStorage.setItem('qisi_access_token', data.access_token);
+        window.location.replace('/admin');
+      } catch (loginError) {
+        error.textContent = loginError.message;
+        submit.disabled = false;
+      }
+    });
+
+    modeSwitch.addEventListener('click', () => setMode(!registerMode));
+
+    setMode(false);
+    checkExistingSession();
+  </script>
+</body>
+</html>

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qisi-study-agent"
+version = "0.1.0"
+description = "启思学伴智能教育 Agent 的 PostgreSQL + pgvector RAG 服务"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+api = ["fastapi>=0.110", "uvicorn>=0.29"]
+cloud = ["openai>=1.0,<3", "python-dotenv>=1.0,<2", "jieba>=0.42.1,<1", "rank-bm25>=0.2.2,<1"]
+reranker = ["sentence-transformers>=3.0,<6"]
+full = [
+  "fastapi>=0.110", "uvicorn>=0.29", "pydantic>=2.0", "psycopg[binary]>=3.1",
+  "langgraph>=0.2", "psycopg[binary]>=3.1", "redis>=5.0", "neo4j>=5.0",
+  "openai>=1.0,<3", "python-dotenv>=1.0,<2", "jieba>=0.42.1,<1", "rank-bm25>=0.2.2,<1",
+  "sentence-transformers>=3.0,<6"
+]
+test = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.setuptools.packages.find]
+include = ["qisi_agent*"]
+
+[tool.setuptools.data-files]
+"migrations" = ["migrations/001_runtime_schema.sql", "migrations/002_admin_activity.sql", "migrations/003_admin_directory_scope.sql"]

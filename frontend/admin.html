@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#102b40" />
+  <title>启思学伴 · 管理后台</title>
+  <link rel="stylesheet" href="/static/styles.css?v=admin-dashboard-1" />
+</head>
+<body class="admin-page">
+  <div class="admin-app">
+    <aside class="admin-sidebar" aria-label="管理后台导航">
+      <div class="admin-brand"><span class="brand-symbol">启</span><div><strong>启思学伴</strong><small>管理员控制台</small></div></div>
+      <div class="admin-sidebar-caption">WORKSPACE</div>
+      <nav class="admin-nav">
+        <button class="admin-nav-item active" data-admin-view="dashboard" type="button"><span>✦</span><b>仪表盘</b><small>系统全局概览</small></button>
+        <button class="admin-nav-item" data-admin-view="users" type="button"><span>▦</span><b>用户管理</b><small>账号与权限</small></button>
+        <button class="admin-nav-item" data-admin-view="mistakes" type="button"><span>⌁</span><b>错题记录</b><small>学生练习反馈</small></button>
+        <button class="admin-nav-item" data-admin-view="questions" type="button"><span>？</span><b>提问记录</b><small>学习对话问题</small></button>
+        <button class="admin-nav-item" data-admin-view="content" type="button"><span>◈</span><b>教材与题库</b><small>知识内容导入</small></button>
+      </nav>
+      <div class="admin-sidebar-foot">
+        <div class="admin-account"><span class="admin-account-avatar">管</span><span><b id="admin-user-name">正在验证身份…</b><small>管理员</small></span></div>
+        <button id="admin-logout" class="admin-logout" type="button">退出登录 <span>→</span></button>
+      </div>
+    </aside>
+
+    <main class="admin-main">
+      <header class="admin-topbar">
+        <div><span class="section-label">SYSTEM CONTROL</span><h1 id="admin-view-title">仪表盘</h1><p id="admin-view-subtitle">掌握账号、内容和学习活动的整体状态。</p></div>
+        <div class="admin-topbar-meta"><span class="admin-online-dot"></span><span>知识服务在线</span><button id="admin-refresh-current" class="admin-refresh-button" type="button">刷新 ↻</button></div>
+      </header>
+
+      <section id="admin-dashboard-view" class="admin-view active-admin-view" data-admin-panel="dashboard">
+        <div class="admin-dashboard-hero"><div><span class="section-label">SYSTEM PULSE</span><h2>让每一次学习活动，都有清晰的落点。</h2><p>这里汇总账号结构、学习反馈和内容服务状态，方便你快速找到需要处理的事情。</p><div class="admin-hero-actions"><button class="admin-primary-button" data-admin-view="users" type="button">管理用户 <span>→</span></button><button class="admin-ghost-button" data-admin-view="mistakes" type="button">查看错题</button></div></div><div class="admin-dashboard-orbit" aria-hidden="true"><span>启</span><i></i><i></i></div></div>
+        <div class="admin-stats admin-user-stats admin-dashboard-stats">
+          <article class="admin-stat admin-stat-teal"><span class="section-label">TOTAL USERS</span><strong id="dash-stat-users">—</strong><span>真实注册用户</span><em id="dash-stat-users-trend">同步中</em></article>
+          <article class="admin-stat admin-stat-yellow"><span class="section-label">STUDENT / TEACHER</span><strong id="dash-stat-ratio">—</strong><span>学习角色结构</span><em>学生 · 教师</em></article>
+          <article class="admin-stat admin-stat-coral"><span class="section-label">REVIEW QUEUE</span><strong id="dash-stat-mistakes">—</strong><span>待复习错题</span><em id="dash-stat-mistakes-trend">保持队列清晰</em></article>
+          <article class="admin-stat admin-stat-blue"><span class="section-label">KNOWLEDGE BASE</span><strong id="dash-stat-chunks">—</strong><span>知识内容片段</span><em id="dash-stat-model">服务正常</em></article>
+        </div>
+        <div class="admin-dashboard-grid"><section class="admin-panel admin-health-panel"><div class="admin-panel-head"><div><span class="section-label">ACCOUNT MIX</span><h2>账号结构</h2></div><span class="admin-health-badge"><i></i>运行稳定</span></div><div id="admin-role-bars" class="admin-role-bars"><span class="muted-copy">正在加载账号结构…</span></div></section><section class="admin-panel admin-quick-panel"><div class="admin-panel-head"><div><span class="section-label">QUICK ACCESS</span><h2>快捷入口</h2></div><span class="admin-panel-mark">03</span></div><div class="admin-quick-links"><button data-admin-view="users" type="button"><span>▦</span><b>用户管理</b><small>查看账号与状态 →</small></button><button data-admin-view="mistakes" type="button"><span>⌁</span><b>错题记录</b><small>定位待复习知识点 →</small></button><button data-admin-view="questions" type="button"><span>？</span><b>提问记录</b><small>了解真实学习需求 →</small></button></div></section></div>
+        <section class="admin-panel admin-signal-panel"><div class="admin-panel-head"><div><span class="section-label">ACTIVITY SIGNALS</span><h2>系统信号</h2></div><button class="text-button" data-admin-view="content" type="button">管理教材与题库 →</button></div><div id="admin-dashboard-signals" class="admin-dashboard-signals"><span class="muted-copy">正在整理系统活动…</span></div></section>
+      </section>
+
+      <section id="admin-users-view" class="admin-view" data-admin-panel="users">
+        <div class="admin-stats admin-user-stats">
+          <article class="admin-stat"><span class="section-label">TOTAL USERS</span><strong id="stat-users">—</strong><span>注册用户</span></article>
+          <article class="admin-stat"><span class="section-label">STUDENTS</span><strong id="stat-students">—</strong><span>学生账号</span></article>
+          <article class="admin-stat"><span class="section-label">TEACHERS</span><strong id="stat-teachers">—</strong><span>教师账号</span></article>
+          <article class="admin-stat admin-stat-alert"><span class="section-label">DISABLED</span><strong id="stat-disabled">—</strong><span>停用账号</span></article>
+        </div>
+        <section class="admin-panel admin-directory-panel">
+          <div class="admin-panel-head"><div><span class="section-label">USER DIRECTORY</span><h2>用户与权限</h2><p class="admin-panel-note">首页只处理账号、角色和访问状态。</p></div><form id="admin-search" class="admin-search"><input id="admin-search-input" placeholder="搜索用户名或显示名称" /><button type="submit">搜索</button></form></div>
+          <div class="admin-tools"><label>角色<select id="admin-role-filter"><option value="all">全部角色</option><option value="student">学生</option><option value="teacher">教师</option><option value="admin">管理员</option></select></label><label>状态<select id="admin-status-filter"><option value="all">全部状态</option><option value="active">启用</option><option value="disabled">停用</option></select></label><span class="admin-tool-spacer"></span><button id="admin-export-users" type="button">导出用户 CSV</button></div>
+          <p id="admin-error" class="admin-error" role="alert"></p>
+          <div id="admin-users" class="admin-table"><span class="muted-copy">正在加载用户…</span></div>
+          <div id="admin-pagination" class="admin-pagination" hidden><button id="admin-prev-page" type="button">上一页</button><span id="admin-page-label"></span><button id="admin-next-page" type="button">下一页</button></div>
+        </section>
+      </section>
+
+      <section id="admin-mistakes-view" class="admin-view" data-admin-panel="mistakes">
+        <div class="admin-page-intro"><span class="section-label">MISTAKE ARCHIVE</span><h2>错题记录</h2><p>集中查看学生在练习中答错的题目和待复习知识点。</p><div class="admin-activity-counts"><span><b id="mistake-total-count">—</b> 条错题</span><span><b id="mistake-pending-count">—</b> 条待复习</span></div></div>
+        <section class="admin-panel">
+          <div class="admin-activity-toolbar"><label>学生<select id="mistake-user"><option value="">请选择学生</option></select></label><label>知识点<select id="mistake-point"><option value="">请选择知识点</option></select></label><label>状态<select id="mistake-status"><option value="all">全部状态</option><option value="unreviewed">待复习</option><option value="reviewed">已复习</option></select></label><button id="mistake-apply" class="admin-primary-button" type="button">查看记录</button></div>
+          <p id="mistake-error" class="admin-error" role="alert"></p>
+          <div id="admin-mistakes" class="admin-activity-list"><span class="muted-copy">正在加载错题…</span></div>
+          <div id="mistake-pagination" class="admin-pagination" hidden><button id="mistake-prev" type="button">上一页</button><span id="mistake-page-label"></span><button id="mistake-next" type="button">下一页</button></div>
+        </section>
+      </section>
+
+      <section id="admin-questions-view" class="admin-view" data-admin-panel="questions">
+        <div class="admin-page-intro"><span class="section-label">QUESTION LOG</span><h2>提问记录</h2><p>查看学生在学习对话中提出的问题，了解真实学习需求。</p><div class="admin-activity-counts"><span><b id="question-total-count">—</b> 条提问</span><span>按时间倒序排列</span></div></div>
+        <section class="admin-panel">
+          <div class="admin-activity-toolbar"><label>学生<select id="question-user"><option value="">请选择学生</option></select></label><button id="question-apply" class="admin-primary-button" type="button">查看提问</button></div>
+          <p id="question-error" class="admin-error" role="alert"></p>
+          <div id="admin-questions" class="admin-activity-list"><span class="muted-copy">正在加载提问…</span></div>
+          <div id="question-pagination" class="admin-pagination" hidden><button id="question-prev" type="button">上一页</button><span id="question-page-label"></span><button id="question-next" type="button">下一页</button></div>
+        </section>
+      </section>
+
+      <section id="admin-content-view" class="admin-view" data-admin-panel="content">
+        <div class="admin-page-intro"><span class="section-label">KNOWLEDGE INGESTION</span><h2>教材与题库</h2><p>上传教材或结构化题库，排队处理后供学习端使用。</p></div>
+        <section class="admin-panel">
+          <div class="admin-panel-head"><div><span class="section-label">CONTENT PIPELINE</span><h2>上传内容</h2></div><button id="refresh-documents" class="text-button" type="button">刷新 ↻</button></div>
+          <form id="document-form" class="document-form"><input id="document-file" type="file" accept=".md,.markdown,.txt,.json,.jsonl,.csv" required /><select id="document-grade" aria-label="文档年级"><option value="grade7">七年级</option><option value="grade8">八年级</option><option value="grade9">九年级</option></select><button type="submit">上传并排队</button></form>
+          <div id="document-jobs" class="job-list">上传后将在这里显示处理任务。</div><div id="document-list" class="job-list">正在加载文档…</div>
+        </section>
+      </section>
+    </main>
+  </div>
+  <script src="/static/admin.js?v=admin-refresh-1"></script>
+</body>
+</html>
