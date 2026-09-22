@@ -18,6 +18,11 @@ class AuthError(ValueError):
     pass
 
 
+STUDENT_REMEMBER_TTL_SECONDS = 7 * 24 * 3600
+SESSION_TTL_SECONDS = 8 * 3600
+ADMIN_TTL_SECONDS = 2 * 3600
+
+
 @dataclass(frozen=True, slots=True)
 class User:
     user_id: str
@@ -40,7 +45,7 @@ def _unb64(value: str) -> bytes:
 
 class AuthStore:
     def __init__(self, database_path: str | Path = "data/runtime/auth.sqlite3",
-                 secret_key: str | None = None, token_ttl_seconds: int = 86400):
+                 secret_key: str | None = None, token_ttl_seconds: int = STUDENT_REMEMBER_TTL_SECONDS):
         self.database_path = Path(database_path)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self.token_ttl_seconds = token_ttl_seconds
@@ -77,6 +82,7 @@ class AuthStore:
                     password_hash TEXT NOT NULL,
                     role TEXT NOT NULL DEFAULT 'student',
                     status TEXT NOT NULL DEFAULT 'active',
+                    auth_token_version INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE TABLE IF NOT EXISTS sessions (
@@ -88,6 +94,8 @@ class AuthStore:
             columns = {row["name"] for row in db.execute("PRAGMA table_info(users)")}
             if "status" not in columns:
                 db.execute("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+            if "auth_token_version" not in columns:
+                db.execute("ALTER TABLE users ADD COLUMN auth_token_version INTEGER NOT NULL DEFAULT 1")
 
     @staticmethod
     def _validate_credentials(username: str, password: str) -> tuple[str, str]:
@@ -166,10 +174,24 @@ class AuthStore:
             raise AuthError("用户名或密码错误")
         return self._row_to_user(row)
 
-    def issue_token(self, user: User) -> str:
+    def _token_ttl(self, user: User, remember_me: bool) -> int:
+        desired = ADMIN_TTL_SECONDS if user.role == "admin" else (
+            STUDENT_REMEMBER_TTL_SECONDS if user.role == "student" and remember_me else SESSION_TTL_SECONDS
+        )
+        return min(desired, self.token_ttl_seconds)
+
+    def _token_version(self, user_id: str) -> int:
+        with self._connect() as db:
+            row = db.execute("SELECT auth_token_version FROM users WHERE user_id=?", (user_id,)).fetchone()
+        if not row:
+            raise AuthError("用户不存在")
+        return int(row["auth_token_version"])
+
+    def issue_token(self, user: User, *, remember_me: bool = False) -> str:
         now = int(time.time())
         header = _b64(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode())
-        payload = _b64(json.dumps({"sub": user.user_id, "iat": now, "exp": now + self.token_ttl_seconds},
+        payload = _b64(json.dumps({"sub": user.user_id, "iat": now, "exp": now + self._token_ttl(user, remember_me),
+                                   "ver": self._token_version(user.user_id)},
                                   separators=(",", ":")).encode())
         unsigned = f"{header}.{payload}"
         return f"{unsigned}.{_b64(hmac.new(self.secret, unsigned.encode(), hashlib.sha256).digest())}"
@@ -184,14 +206,29 @@ class AuthStore:
             data = json.loads(_unb64(payload))
             if int(data["exp"]) < int(time.time()):
                 raise AuthError("访问令牌已过期，请重新登录")
-            user_id = str(data["sub"])
+            user_id, token_version = str(data["sub"]), int(data["ver"])
         except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
             raise AuthError("访问令牌无效") from exc
         with self._connect() as db:
             row = db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
-        if not row or row["status"] != "active":
+        if not row or row["status"] != "active" or int(row["auth_token_version"]) != token_version:
             raise AuthError("用户不存在")
         return self._row_to_user(row)
+
+    def revoke_all_tokens(self, user_id: str) -> None:
+        with self._connect() as db:
+            result = db.execute("UPDATE users SET auth_token_version=auth_token_version+1 WHERE user_id=?", (user_id,))
+        if result.rowcount != 1:
+            raise AuthError("用户不存在")
+
+    def change_password(self, user_id: str, current_password: str, new_password: str) -> None:
+        _, new_password = self._validate_credentials("valid-user", new_password)
+        with self._connect() as db:
+            row = db.execute("SELECT password_hash FROM users WHERE user_id=?", (user_id,)).fetchone()
+            if not row or not self._verify_password(current_password, row["password_hash"]):
+                raise AuthError("当前密码不正确")
+            db.execute("UPDATE users SET password_hash=?,auth_token_version=auth_token_version+1 WHERE user_id=?",
+                       (self._hash_password(new_password), user_id))
 
     def list_users(self, search: str = "", limit: int = 50, offset: int = 0) -> tuple[list[dict], int]:
         limit = max(1, min(limit, 100)); offset = max(0, offset); pattern = f"%{search.strip()}%"
@@ -212,6 +249,7 @@ class AuthStore:
         if role is not None: fields.append("role = ?"); values.append(role)
         if status is not None: fields.append("status = ?"); values.append(status)
         if not fields: raise AuthError("没有要修改的字段")
+        fields.append("auth_token_version = auth_token_version + 1")
         values.append(user_id)
         with self._connect() as db:
             result = db.execute(f"UPDATE users SET {', '.join(fields)} WHERE user_id = ?", values)

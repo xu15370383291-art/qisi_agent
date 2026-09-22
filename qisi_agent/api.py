@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 from typing import Literal
@@ -12,7 +13,7 @@ from .memory import MemoryStore
 from .practice import PracticeService
 
 try:  # Optional dependency: core retrieval remains usable without FastAPI.
-    from fastapi import Depends, FastAPI, HTTPException, Header, Request
+    from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Header, Request
     from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
     from fastapi.staticfiles import StaticFiles
     from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -40,6 +41,12 @@ if FastAPI is not None:
         password: str = Field(min_length=6, max_length=128)
         display_name: str = Field(default="", max_length=80)
         role: Literal["student", "teacher", "admin"] = "student"
+        remember_me: bool = False
+
+
+    class PasswordChangeRequest(BaseModel):
+        current_password: str = Field(min_length=6, max_length=128)
+        new_password: str = Field(min_length=6, max_length=128)
 
 
     class AdminRegisterRequest(BaseModel):
@@ -70,6 +77,7 @@ def create_app(rag: Any, *, memory: Any | None = None,
     bearer = HTTPBearer(auto_error=False)
     supervisor = Supervisor(rag, memory=memory, checkpointer=checkpointer)
     practice = practice or PracticeService(rag.index.chunks)
+    login_failures: dict[tuple[str, str], tuple[int, float]] = {}
     frontend_dir = Path(__file__).resolve().parents[1] / "frontend"
     app.mount("/static", StaticFiles(directory=frontend_dir), name="static")
 
@@ -118,13 +126,36 @@ def create_app(rag: Any, *, memory: Any | None = None,
             raise HTTPException(status_code=403, detail="管理员请使用管理后台")
         return user
 
+    def auth_response(user: User, *, remember_me: bool = False) -> dict:
+        # Only students may opt into a browser-persistent login.  The server
+        # independently enforces short administrator/teacher token lifetimes.
+        persistent = user.role == "student" and remember_me
+        return {"user": user.to_dict(), "access_token": auth.issue_token(user, remember_me=persistent),
+                "token_type": "bearer", "persistent_login": persistent}
+
+    def login_key(request: Request, username: str) -> tuple[str, str]:
+        host = request.client.host if request.client else "unknown"
+        return host, username.strip().lower()
+
+    def assert_login_allowed(key: tuple[str, str]) -> None:
+        failures, blocked_until = login_failures.get(key, (0, 0.0))
+        if blocked_until > time.monotonic():
+            raise HTTPException(status_code=429, detail="尝试次数过多，请 15 分钟后再试")
+        if blocked_until:
+            login_failures.pop(key, None)
+
+    def record_login_failure(key: tuple[str, str]) -> None:
+        failures, blocked_until = login_failures.get(key, (0, 0.0))
+        failures += 1
+        login_failures[key] = (failures, time.monotonic() + 15 * 60 if failures >= 5 else blocked_until)
+
     @app.post("/api/auth/register")
     def register(payload: AuthRequest):
         try:
             user = auth.register(payload.username, payload.password, payload.display_name, payload.role)
         except AuthError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"user": user.to_dict(), "access_token": auth.issue_token(user), "token_type": "bearer"}
+        return auth_response(user)
 
     @app.post("/api/auth/admin-register")
     def admin_register(payload: AdminRegisterRequest):
@@ -135,19 +166,36 @@ def create_app(rag: Any, *, memory: Any | None = None,
             )
         except AuthError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"user": user.to_dict(), "access_token": auth.issue_token(user), "token_type": "bearer"}
+        return auth_response(user)
 
     @app.post("/api/auth/login")
-    def login(payload: AuthRequest):
+    def login(payload: AuthRequest, request: Request):
+        key = login_key(request, payload.username)
+        assert_login_allowed(key)
         try:
             user = auth.authenticate(payload.username, payload.password, payload.role)
         except AuthError as exc:
+            record_login_failure(key)
             raise HTTPException(status_code=401, detail=str(exc), headers={"WWW-Authenticate": "Bearer"}) from exc
-        return {"user": user.to_dict(), "access_token": auth.issue_token(user), "token_type": "bearer"}
+        login_failures.pop(key, None)
+        return auth_response(user, remember_me=payload.remember_me)
 
     @app.get("/api/auth/me")
     def me(user: User = Depends(current_user)):
         return user.to_dict()
+
+    @app.post("/api/auth/logout-all")
+    def logout_all(user: User = Depends(current_user)):
+        auth.revoke_all_tokens(user.user_id)
+        return {"status": "ok"}
+
+    @app.post("/api/auth/change-password")
+    def change_password(payload: PasswordChangeRequest, user: User = Depends(current_user)):
+        try:
+            auth.change_password(user.user_id, payload.current_password, payload.new_password)
+        except AuthError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"status": "ok", "message": "密码已更新，请重新登录"}
 
     @app.get("/admin", include_in_schema=False)
     def admin_frontend():
@@ -296,6 +344,136 @@ def create_app(rag: Any, *, memory: Any | None = None,
                 "created_at", "started_at", "finished_at", "document_id", "version_id", "file_name")
         return dict(zip(keys, row))
 
+    @app.post("/api/documents/jobs/{job_id}/retry")
+    def retry_document_job(job_id: str, user: User = Depends(require_teacher)):
+        from .async_ingestion import retry_document_job as requeue_job
+        from .pg_knowledge import database_url_from_env
+        try:
+            return requeue_job(database_url_from_env(), job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="导入任务不存在") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/documents/{document_id}/versions/{version_id}/preview")
+    def document_version_preview(document_id: str, version_id: str,
+                                 limit: int = 50, offset: int = 0,
+                                 user: User = Depends(require_teacher)):
+        del user
+        from .pg_knowledge import database_url_from_env
+        import psycopg
+        limit = max(1, min(limit, 100)); offset = max(0, offset)
+        with psycopg.connect(database_url_from_env()) as conn, conn.cursor() as cur:
+            cur.execute("""
+              SELECT d.document_id, d.document_name, d.grade_id, d.grade_name,
+                     d.document_type, d.status, d.current_version_id,
+                     v.version_id, v.file_name, v.file_hash, v.status,
+                     v.created_by, v.created_at
+              FROM knowledge_documents d
+              JOIN knowledge_document_versions v ON v.document_id=d.document_id
+              WHERE d.document_id=%s AND v.version_id=%s
+            """, (document_id, version_id))
+            version = cur.fetchone()
+            if not version:
+                raise HTTPException(status_code=404, detail="文档版本不存在")
+            cur.execute("""
+              SELECT content_id, chapter_id, title, content, metadata,
+                     source_chunk_id, created_at, updated_at
+              FROM knowledge_contents
+              WHERE document_id=%s AND version_id=%s
+              ORDER BY chapter_id, title, content_id
+              LIMIT %s OFFSET %s
+            """, (document_id, version_id, limit, offset))
+            contents = cur.fetchall()
+            cur.execute("""
+              SELECT COUNT(*)
+              FROM knowledge_contents
+              WHERE document_id=%s AND version_id=%s
+            """, (document_id, version_id))
+            total = cur.fetchone()[0]
+        version_keys = ("document_id", "document_name", "grade_id", "grade_name",
+                        "document_type", "document_status", "current_version_id",
+                        "version_id", "file_name", "file_hash", "version_status",
+                        "created_by", "created_at")
+        content_keys = ("content_id", "chapter_id", "title", "content", "metadata",
+                        "source_chunk_id", "created_at", "updated_at")
+        return {"document": dict(zip(version_keys[:7], version[:7])),
+                "version": dict(zip(version_keys[7:], version[7:])),
+                "items": [dict(zip(content_keys, row)) for row in contents],
+                "total": total, "limit": limit, "offset": offset}
+
+    @app.get("/api/documents/{document_id}/versions")
+    def document_versions(document_id: str, user: User = Depends(require_teacher)):
+        del user
+        from .pg_knowledge import database_url_from_env
+        import psycopg
+        with psycopg.connect(database_url_from_env()) as conn, conn.cursor() as cur:
+            cur.execute("""
+              SELECT d.document_id, d.document_name, d.current_version_id,
+                     v.version_id, v.file_name, v.file_hash, v.status,
+                     v.created_by, v.created_at,
+                     COUNT(c.content_id) AS content_count
+              FROM knowledge_documents d
+              JOIN knowledge_document_versions v ON v.document_id=d.document_id
+              LEFT JOIN knowledge_contents c
+                ON c.document_id=v.document_id AND c.version_id=v.version_id
+              WHERE d.document_id=%s
+              GROUP BY d.document_id, d.document_name, d.current_version_id,
+                       v.version_id, v.file_name, v.file_hash, v.status,
+                       v.created_by, v.created_at
+              ORDER BY v.created_at DESC
+            """, (document_id,))
+            rows = cur.fetchall()
+        if not rows:
+            raise HTTPException(status_code=404, detail="文档不存在或没有版本")
+        keys = ("document_id", "document_name", "current_version_id", "version_id",
+                "file_name", "file_hash", "status", "created_by", "created_at",
+                "content_count")
+        return {"document_id": document_id, "items": [
+            {**dict(zip(keys, row)), "is_current": row[2] == row[3]}
+            for row in rows
+        ]}
+
+    @app.post("/api/documents/{document_id}/versions/{version_id}/publish")
+    def publish_document_version(document_id: str, version_id: str,
+                                 user: User = Depends(require_teacher)):
+        del user
+        from .pg_knowledge import database_url_from_env
+        import psycopg
+        with psycopg.connect(database_url_from_env()) as conn, conn.cursor() as cur:
+            cur.execute("""
+              SELECT v.status, d.current_version_id, COUNT(c.content_id)
+              FROM knowledge_document_versions v
+              JOIN knowledge_documents d USING(document_id)
+              LEFT JOIN knowledge_contents c
+                ON c.document_id=v.document_id AND c.version_id=v.version_id
+              WHERE v.document_id=%s AND v.version_id=%s
+              GROUP BY v.status, d.current_version_id
+            """, (document_id, version_id))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="文档版本不存在")
+            status, current_version_id, content_count = row
+            if status in {"failed", "uploaded", "processing"} or not content_count:
+                raise HTTPException(status_code=409, detail="该版本尚未完成解析，不能设为当前版本")
+            cur.execute("""
+              UPDATE knowledge_document_versions
+              SET status='archived'
+              WHERE document_id=%s AND status='published' AND version_id<>%s
+            """, (document_id, version_id))
+            cur.execute("""
+              UPDATE knowledge_document_versions
+              SET status='published'
+              WHERE document_id=%s AND version_id=%s
+            """, (document_id, version_id))
+            cur.execute("""
+              UPDATE knowledge_documents
+              SET status='published', current_version_id=%s, updated_at=NOW()
+              WHERE document_id=%s
+            """, (version_id, document_id))
+        return {"document_id": document_id, "version_id": version_id,
+                "previous_version_id": current_version_id, "status": "published"}
+
     @app.patch("/api/admin/users/{user_id}")
     def admin_update_user(user_id: str, payload: AdminUserUpdateRequest,
                           user: User = Depends(require_teacher)):
@@ -310,7 +488,8 @@ def create_app(rag: Any, *, memory: Any | None = None,
         return updated.to_dict()
 
     @app.post("/api/chat/stream")
-    def chat_stream(payload: ChatRequest, user: User = Depends(require_learning_user)):
+    def chat_stream(payload: ChatRequest, background_tasks: BackgroundTasks,
+                    user: User = Depends(require_learning_user)):
         try:
             auth.claim_session(payload.session_id, user.user_id)
         except AuthError as exc:
@@ -319,12 +498,10 @@ def create_app(rag: Any, *, memory: Any | None = None,
             stream = supervisor.run_stream(user.user_id, payload.session_id, payload.query,
                                            course_id=payload.course_id, grade_id=payload.grade_id)
             for item in stream:
-                if item["type"] == "meta":
+                if item["type"] == "progress":
+                    yield _sse("progress", {"stage": item["stage"], "message": item["message"]})
+                elif item["type"] == "meta":
                     prepared = item["prepared"]
-                    yield _sse("node_started", {"node": "supervisor", "intent": item["intent"]})
-                    yield _sse("memory_hit", {"count": len(supervisor.memory.recall(user.user_id, payload.query))})
-                    yield _sse("retrieval", {"hits": [hit.to_dict() for hit in prepared["hits"]]})
-                    yield _sse("node_started", {"node": item["intent"], "status": "generating"})
                     for citation in prepared["citations"]:
                         yield _sse("citation", citation.to_dict())
                 elif item["type"] == "delta":
@@ -332,10 +509,23 @@ def create_app(rag: Any, *, memory: Any | None = None,
                 elif item["type"] == "error":
                     yield _sse("error", {"code": "model_error", "message": item["message"]})
                 elif item["type"] == "done":
-                    yield _sse("done", {"confidence": item["confidence"], "refused": False,
+                    yield _sse("done", {"confidence": item["confidence"], "refused": item.get("refused", False),
                                          "source": item["source"]})
+                elif item["type"] == "memory_update":
+                    background_tasks.add_task(
+                        supervisor.persist_completed_turn, item["user_id"], item["session_id"],
+                        item["query"], item["answer"],
+                    )
 
-        return StreamingResponse(events(), media_type="text/event-stream")
+        return StreamingResponse(
+            events(),
+            media_type="text/event-stream",
+            headers={
+                "Content-Type": "text/event-stream; charset=utf-8",
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @app.get("/api/practice/quiz")
     def practice_quiz(grade_id: str = "grade7", count: int = 5, difficulty: str | None = None,

@@ -5,6 +5,7 @@ import hashlib
 import json
 import secrets
 import time
+import warnings
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,8 @@ def ensure_runtime_schema(database_url: str) -> None:
     admin_activity_sql = (migrations_dir / "002_admin_activity.sql").read_text(encoding="utf-8")
     admin_scope_sql = (migrations_dir / "003_admin_directory_scope.sql").read_text(encoding="utf-8")
     content_lineage_sql = (migrations_dir / "004_knowledge_content_lineage.sql").read_text(encoding="utf-8")
+    memory_lifecycle_sql = (migrations_dir / "005_learning_memory_lifecycle.sql").read_text(encoding="utf-8")
+    auth_lifecycle_sql = (migrations_dir / "006_auth_token_lifecycle.sql").read_text(encoding="utf-8")
     with psycopg.connect(database_url) as conn:
         conn.execute(sql)
         conn.execute("INSERT INTO runtime_schema_migrations(version) VALUES (%s) ON CONFLICT DO NOTHING", ("001_runtime_schema",))
@@ -41,10 +44,14 @@ def ensure_runtime_schema(database_url: str) -> None:
         conn.execute("INSERT INTO runtime_schema_migrations(version) VALUES (%s) ON CONFLICT DO NOTHING", ("002_admin_activity",))
         conn.execute(admin_scope_sql)
         conn.execute("INSERT INTO runtime_schema_migrations(version) VALUES (%s) ON CONFLICT DO NOTHING", ("003_admin_directory_scope",))
+        conn.execute(memory_lifecycle_sql)
+        conn.execute("INSERT INTO runtime_schema_migrations(version) VALUES (%s) ON CONFLICT DO NOTHING", ("005_learning_memory_lifecycle",))
+        conn.execute(auth_lifecycle_sql)
+        conn.execute("INSERT INTO runtime_schema_migrations(version) VALUES (%s) ON CONFLICT DO NOTHING", ("006_auth_token_lifecycle",))
 
 
 class PostgresAuthStore:
-    def __init__(self, database_url: str, secret_key: str | None = None, token_ttl_seconds: int = 86400):
+    def __init__(self, database_url: str, secret_key: str | None = None, token_ttl_seconds: int = 604800):
         self.database_url, self.token_ttl_seconds = database_url, token_ttl_seconds
         ensure_runtime_schema(database_url)
         if secret_key:
@@ -105,10 +112,25 @@ class PostgresAuthStore:
             raise AuthError("用户名或密码错误")
         return self._row_user(row)
 
-    def issue_token(self, user: User) -> str:
+    def _token_ttl(self, user: User, remember_me: bool) -> int:
+        from .auth import ADMIN_TTL_SECONDS, SESSION_TTL_SECONDS, STUDENT_REMEMBER_TTL_SECONDS
+        desired = ADMIN_TTL_SECONDS if user.role == "admin" else (
+            STUDENT_REMEMBER_TTL_SECONDS if user.role == "student" and remember_me else SESSION_TTL_SECONDS
+        )
+        return min(desired, self.token_ttl_seconds)
+
+    def _token_version(self, user_id: str) -> int:
+        with psycopg.connect(self.database_url) as conn:
+            row = conn.execute("SELECT auth_token_version FROM app_users WHERE user_id=%s", (user_id,)).fetchone()
+        if not row:
+            raise AuthError("用户不存在")
+        return int(row[0])
+
+    def issue_token(self, user: User, *, remember_me: bool = False) -> str:
         now = int(time.time())
         header = _b64(b'{"alg":"HS256","typ":"JWT"}')
-        payload = _b64(json.dumps({"sub": user.user_id, "iat": now, "exp": now + self.token_ttl_seconds}, separators=(",", ":")).encode())
+        payload = _b64(json.dumps({"sub": user.user_id, "iat": now, "exp": now + self._token_ttl(user, remember_me),
+                                   "ver": self._token_version(user.user_id)}, separators=(",", ":")).encode())
         unsigned = f"{header}.{payload}"
         import hmac
         return f"{unsigned}.{_b64(hmac.new(self.secret, unsigned.encode(), hashlib.sha256).digest())}"
@@ -123,14 +145,28 @@ class PostgresAuthStore:
             data = json.loads(_unb64(payload))
             if int(data["exp"]) < int(time.time()):
                 raise AuthError("访问令牌已过期，请重新登录")
-            user_id = str(data["sub"])
+            user_id, token_version = str(data["sub"]), int(data["ver"])
         except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
             raise AuthError("访问令牌无效") from exc
         with psycopg.connect(self.database_url) as conn:
-            row = conn.execute("SELECT user_id,username,display_name,role,status FROM app_users WHERE user_id=%s", (user_id,)).fetchone()
-        if not row or row[4] != "active":
+            row = conn.execute("SELECT user_id,username,display_name,role,status,auth_token_version FROM app_users WHERE user_id=%s", (user_id,)).fetchone()
+        if not row or row[4] != "active" or int(row[5]) != token_version:
             raise AuthError("用户不存在")
         return self._row_user(row)
+
+    def revoke_all_tokens(self, user_id: str) -> None:
+        with psycopg.connect(self.database_url) as conn:
+            row = conn.execute("UPDATE app_users SET auth_token_version=auth_token_version+1,updated_at=NOW() WHERE user_id=%s RETURNING user_id", (user_id,)).fetchone()
+        if not row:
+            raise AuthError("用户不存在")
+
+    def change_password(self, user_id: str, current_password: str, new_password: str) -> None:
+        _, new_password = self._validate("valid-user", new_password)
+        with psycopg.connect(self.database_url) as conn:
+            row = conn.execute("SELECT password_hash FROM app_users WHERE user_id=%s FOR UPDATE", (user_id,)).fetchone()
+            if not row or not AuthStore._verify_password(current_password, row[0]):
+                raise AuthError("当前密码不正确")
+            conn.execute("UPDATE app_users SET password_hash=%s,auth_token_version=auth_token_version+1,updated_at=NOW() WHERE user_id=%s", (AuthStore._hash_password(new_password), user_id))
 
     def list_users(self, search: str = "", limit: int = 50, offset: int = 0) -> tuple[list[dict], int]:
         limit, offset, pattern = max(1, min(limit, 100)), max(0, offset), f"%{search.strip()}%"
@@ -245,6 +281,7 @@ class PostgresAuthStore:
         if role is not None: sets += ["role=%s"]; vals += [role]
         if status is not None: sets += ["status=%s"]; vals += [status]
         if not sets: raise AuthError("没有要修改的字段")
+        sets += ["auth_token_version=auth_token_version+1"]
         vals.append(user_id)
         with psycopg.connect(self.database_url) as conn:
             row = conn.execute(f"UPDATE app_users SET {','.join(sets)},updated_at=NOW() WHERE user_id=%s RETURNING user_id,username,display_name,role", vals).fetchone()
@@ -269,15 +306,44 @@ class PostgresAuthStore:
 
 
 class PostgresMemoryStore(MemoryStore):
-    def __init__(self, database_url: str, ttl_seconds: int = 3600):
+    def __init__(self, database_url: str, ttl_seconds: int = 3600, *, context_embedder: Any | None = None):
         self.database_url, self.ttl_seconds, self.embedding = database_url, ttl_seconds, HashEmbedding()
+        self.context_embedder = context_embedder
         ensure_runtime_schema(database_url)
+        if context_embedder is not None:
+            from .student_context import ensure_student_context_embedding_schema
+            ensure_student_context_embedding_schema(database_url, context_embedder)
+
+    def _refresh_context_embedding(self, source_type: str, source_id: str,
+                                   student_id: str, text: str) -> None:
+        """Keep retrieval vectors current without making durable learning data depend on an API call."""
+        if self.context_embedder is None:
+            return
+        try:
+            from .student_context import upsert_student_context_embedding
+            upsert_student_context_embedding(
+                self.database_url, source_type=source_type, source_id=source_id,
+                student_id=student_id, text=text, embedder=self.context_embedder,
+            )
+        except Exception as exc:
+            # The source record is already committed.  Operators can backfill it
+            # with `memory-embed` after an embedding provider outage.
+            warnings.warn(f"学生学习证据向量暂未同步：{exc}", RuntimeWarning, stacklevel=2)
 
     @property
     def long_term(self) -> dict[str, MemoryItem]:
         with psycopg.connect(self.database_url) as conn:
-            rows = conn.execute("SELECT memory_id,student_id,content,memory_type,course_id,knowledge_point_id,confidence,importance,occurred_at,source_message_id,version,status FROM learning_memories ORDER BY occurred_at DESC").fetchall()
-        return {r[0]: MemoryItem(*[str(v) if i in {8} and v is not None else v for i, v in enumerate(r)]) for r in rows}
+            rows = conn.execute("""SELECT memory_id,student_id,content,memory_type,course_id,knowledge_point_id,
+                               confidence,importance,occurred_at,source_message_id,version,status,semantic_key,
+                               COALESCE(supersedes_memory_id,''),status_reason,COALESCE(last_reinforced_at::text,''),
+                               COALESCE(valid_until::text,''),COALESCE(archived_at::text,'')
+                               FROM learning_memories ORDER BY occurred_at DESC""").fetchall()
+        items = {}
+        for row in rows:
+            values = list(row)
+            values[8] = str(values[8])
+            items[values[0]] = MemoryItem(*values)
+        return items
 
     @property
     def mistakes(self) -> dict[str, dict]:
@@ -305,7 +371,10 @@ class PostgresMemoryStore(MemoryStore):
             conn.execute("UPDATE learning_conversations SET updated_at=NOW(),title=CASE WHEN title='新学习对话' AND %s='user' THEN LEFT(%s,32) ELSE title END WHERE session_id=%s", (role, content, session_id))
     def get_messages(self, session_id: str) -> list[dict]:
         with psycopg.connect(self.database_url) as conn:
-            rows = conn.execute("SELECT role,content,created_at FROM conversation_messages WHERE session_id=%s ORDER BY created_at DESC LIMIT 20", (session_id,)).fetchall()
+            # `created_at` can be identical for a quickly-written user/assistant pair.
+            # The BIGSERIAL id is the durable insertion order, so use it when rebuilding
+            # the conversation shown to the model and the browser.
+            rows = conn.execute("SELECT role,content,created_at FROM conversation_messages WHERE session_id=%s ORDER BY message_id DESC LIMIT 20", (session_id,)).fetchall()
         return [{"role": r[0], "content": r[1], "at": r[2].isoformat() if hasattr(r[2], "isoformat") else str(r[2])} for r in reversed(rows)]
     def delete_session(self, session_id: str) -> None:
         with psycopg.connect(self.database_url) as conn: conn.execute("DELETE FROM app_sessions WHERE session_id=%s", (session_id,))
@@ -314,30 +383,110 @@ class PostgresMemoryStore(MemoryStore):
         return {"session_id": session_id, "title": first[:32], "message_count": len(msgs), "updated_at": msgs[-1]["at"] if msgs else ""}
     def write(self, student_id: str, content: str, **kwargs) -> MemoryItem:
         item_id = hashlib.sha1(f"{student_id}:{content}".encode()).hexdigest()[:16]
+        initial_status = str(kwargs.get("initial_status", "candidate"))
+        if initial_status not in {"candidate", "active", "updated", "superseded", "stale", "archived", "conflict", "deleted"}:
+            raise ValueError("无效的记忆状态")
         with psycopg.connect(self.database_url) as conn:
             row = conn.execute("SELECT memory_id,version FROM learning_memories WHERE memory_id=%s", (item_id,)).fetchone()
-            vals = (student_id, content, kwargs.get("course_id", ""), kwargs.get("knowledge_point_id", ""), kwargs.get("confidence", .8), kwargs.get("importance", .5), kwargs.get("source_message_id", ""))
+            vals = (student_id, content, kwargs.get("memory_type", "learning_event"), kwargs.get("course_id", ""),
+                    kwargs.get("knowledge_point_id", ""), kwargs.get("confidence", .8), kwargs.get("importance", .5),
+                    kwargs.get("source_message_id", ""), kwargs.get("semantic_key", ""),
+                    kwargs.get("supersedes_memory_id", "") or None, kwargs.get("status_reason", ""))
             if row:
-                conn.execute("UPDATE learning_memories SET content=%s,course_id=%s,knowledge_point_id=%s,confidence=%s,importance=%s,source_message_id=%s,version=version+1,status='updated',updated_at=NOW() WHERE memory_id=%s", (content, vals[2], vals[3], vals[4], vals[5], vals[6], item_id))
+                conn.execute("""UPDATE learning_memories SET content=%s,memory_type=%s,course_id=%s,knowledge_point_id=%s,
+                              confidence=%s,importance=%s,source_message_id=%s,semantic_key=%s,
+                              supersedes_memory_id=COALESCE(%s,supersedes_memory_id),status_reason=%s,
+                              last_reinforced_at=NOW(),version=version+1,status='updated',updated_at=NOW()
+                              WHERE memory_id=%s""", (content, *vals[2:], item_id))
             else:
-                conn.execute("INSERT INTO learning_memories(memory_id,student_id,content,course_id,knowledge_point_id,confidence,importance,source_message_id,occurred_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())", (item_id, *vals))
-        return self.long_term[item_id]
+                conn.execute("""INSERT INTO learning_memories(memory_id,student_id,content,memory_type,course_id,knowledge_point_id,
+                              confidence,importance,source_message_id,semantic_key,supersedes_memory_id,status_reason,status,occurred_at)
+                              VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())""", (item_id, *vals, initial_status))
+        item = self.long_term[item_id]
+        self.record_memory_evidence(item.memory_id, "message", str(kwargs.get("source_message_id", "")),
+                                     "supports", {"content": content})
+        self._upsert_knowledge_state(item)
+        from .student_context import memory_embedding_text
+        self._refresh_context_embedding("memory", item.memory_id, student_id, memory_embedding_text(item))
+        return item
     def recall(self, student_id: str, query: str, top_k: int = 5) -> list[MemoryItem]:
         q = self.embedding.embed(query); rows = [(cosine(q, self.embedding.embed(i.content)) * (.5 + i.importance / 2), i) for i in self.long_term.values() if i.student_id == student_id and i.status != "deleted"]; rows.sort(key=lambda x:x[0], reverse=True); return [i for _,i in rows[:top_k]]
     def review(self, memory_id: str, action: str, content: str | None = None) -> MemoryItem:
         item = self.long_term.get(memory_id)
         if not item: raise KeyError(memory_id)
-        if action == "delete": sql, vals = "status='deleted'", ()
+        if action == "delete": sql, vals = "status='deleted',status_reason='人工删除'", ()
+        elif action == "archive": sql, vals = "status='archived',archived_at=NOW(),status_reason='人工归档'", ()
+        elif action == "stale": sql, vals = "status='stale',status_reason='人工标记过期'", ()
         elif action in {"approve", "activate"}: sql, vals = "status='active'", ()
         elif action == "correct" and content and content.strip(): sql, vals = "content=%s,status='updated',version=version+1", (content.strip(),)
         else: raise ValueError("correct 操作需要 content" if action == "correct" else f"未知审核操作：{action}")
         with psycopg.connect(self.database_url) as conn: conn.execute(f"UPDATE learning_memories SET {sql},updated_at=NOW() WHERE memory_id=%s", (*vals, memory_id))
-        return self.long_term[memory_id]
+        updated = self.long_term[memory_id]
+        self._upsert_knowledge_state(updated)
+        if updated.status != "deleted":
+            from .student_context import memory_embedding_text
+            self._refresh_context_embedding("memory", updated.memory_id, updated.student_id, memory_embedding_text(updated))
+        return updated
+
+    def record_memory_evidence(self, memory_id: str, source_kind: str, source_id: str,
+                               evidence_role: str, payload: dict[str, Any]) -> None:
+        with psycopg.connect(self.database_url) as conn:
+            conn.execute("""INSERT INTO learning_memory_evidence(memory_id,source_kind,source_id,evidence_role,payload)
+                         VALUES (%s,%s,%s,%s,%s)""",
+                         (memory_id, source_kind, source_id, evidence_role, json.dumps(payload, ensure_ascii=False)))
+
+    def list_memory_evidence(self, memory_id: str) -> list[dict[str, Any]]:
+        with psycopg.connect(self.database_url) as conn:
+            rows = conn.execute("""SELECT source_kind,source_id,evidence_role,payload,created_at
+                                FROM learning_memory_evidence WHERE memory_id=%s ORDER BY evidence_id""",
+                                (memory_id,)).fetchall()
+        return [{"source_kind": row[0], "source_id": row[1], "evidence_role": row[2],
+                 "payload": row[3], "created_at": str(row[4])} for row in rows]
+
+    def transition_memory(self, memory_id: str, status: str, *, reason: str = "",
+                          supersedes_memory_id: str = "") -> MemoryItem:
+        allowed = {"candidate", "active", "updated", "superseded", "stale", "archived", "conflict", "deleted"}
+        if status not in allowed:
+            raise ValueError("无效的记忆状态")
+        with psycopg.connect(self.database_url) as conn:
+            conn.execute("""UPDATE learning_memories SET status=%s,status_reason=%s,
+                         supersedes_memory_id=COALESCE(%s,supersedes_memory_id),
+                         archived_at=CASE WHEN %s='archived' THEN NOW() ELSE archived_at END,updated_at=NOW()
+                         WHERE memory_id=%s""", (status, reason, supersedes_memory_id or None, status, memory_id))
+        item = self.long_term.get(memory_id)
+        if item is None:
+            raise KeyError(memory_id)
+        self.record_memory_evidence(memory_id, "memory", supersedes_memory_id, "supersedes" if status == "superseded" else "contradicts" if status == "conflict" else "supports", {"reason": reason})
+        self._upsert_knowledge_state(item)
+        return item
+
+    def _upsert_knowledge_state(self, item: MemoryItem) -> None:
+        if not item.knowledge_point_id:
+            return
+        state = "unknown"
+        if item.status == "conflict": state = "conflict"
+        elif item.status in {"candidate", "active", "updated"}:
+            normalized = item.content.lower()
+            state = "mastered" if any(word in normalized for word in ("掌握", "学会", "会做")) else "needs_review" if any(word in normalized for word in ("不会", "错误", "错", "薄弱", "复习")) else "learning"
+        with psycopg.connect(self.database_url) as conn:
+            conn.execute("""INSERT INTO student_knowledge_states(student_id,knowledge_point_id,status,confidence,active_memory_id)
+                         VALUES (%s,%s,%s,%s,%s)
+                         ON CONFLICT(student_id,knowledge_point_id) DO UPDATE SET status=EXCLUDED.status,
+                         confidence=EXCLUDED.confidence,active_memory_id=EXCLUDED.active_memory_id,updated_at=NOW()""",
+                         (item.student_id, item.knowledge_point_id, state, item.confidence, item.memory_id))
     def write_mistake(self, student_id: str, **kwargs) -> dict:
         mistake_id = hashlib.sha1(f"{student_id}:{kwargs.get('prompt','')}:{kwargs.get('source_message_id','')}".encode()).hexdigest()[:16]
         item = {"mistake_id": mistake_id, "student_id": student_id, **{k: kwargs.get(k, "") for k in ("prompt","student_answer","correct_answer","explanation","knowledge_point_id","source_message_id")}, "status":"unreviewed", "created_at":utc_now()}
         with psycopg.connect(self.database_url) as conn: conn.execute("INSERT INTO learning_mistakes(mistake_id,student_id,prompt,student_answer,correct_answer,explanation,knowledge_point_id,source_message_id) VALUES (%(mistake_id)s,%(student_id)s,%(prompt)s,%(student_answer)s,%(correct_answer)s,%(explanation)s,%(knowledge_point_id)s,%(source_message_id)s) ON CONFLICT (mistake_id) DO UPDATE SET prompt=EXCLUDED.prompt", item)
+        from .student_context import mistake_embedding_text
+        self._refresh_context_embedding("mistake", mistake_id, student_id, mistake_embedding_text(item))
         return item
+
+    def sync_context_embeddings(self, *, force: bool = False) -> dict[str, int | str]:
+        if self.context_embedder is None:
+            raise RuntimeError("补全学生学习证据向量需要配置 Embedding 服务")
+        from .student_context import sync_student_context_embeddings
+        return sync_student_context_embeddings(self.database_url, self.context_embedder, force=force)
     def list_mistakes(self, student_id: str, *, include_reviewed: bool = True) -> list[dict]:
         sql = "SELECT mistake_id,student_id,prompt,student_answer,correct_answer,explanation,knowledge_point_id,source_message_id,status,created_at,reviewed_at FROM learning_mistakes WHERE student_id=%s" + ("" if include_reviewed else " AND status<>'reviewed'") + " ORDER BY created_at DESC"
         with psycopg.connect(self.database_url) as conn: rows = conn.execute(sql, (student_id,)).fetchall()
@@ -363,6 +512,9 @@ class PostgresMemoryStore(MemoryStore):
         return {"student_id":student_id,"memory_count":len(items),"knowledge_points":sorted({i.knowledge_point_id for i in items if i.knowledge_point_id}),"recent_events":[i.content for i in sorted(items,key=lambda x:x.occurred_at,reverse=True)[:10]],"mastery":self.mastery(student_id)}
     def list_for_student(self, student_id: str, *, include_deleted: bool=False) -> list[MemoryItem]:
         return sorted([i for i in self.long_term.values() if i.student_id==student_id and (include_deleted or i.status!="deleted")], key=lambda x:x.occurred_at, reverse=True)
+
+    def list_for_student_all(self) -> list[MemoryItem]:
+        return list(self.long_term.values())
 
 
 class PostgresCheckpointStore:

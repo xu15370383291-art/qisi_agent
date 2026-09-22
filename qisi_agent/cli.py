@@ -32,6 +32,9 @@ def main() -> None:
     pg_import.add_argument("--source", default="data/corpus")
     pg_embed = sub.add_parser("pg-embed", help="使用百炼 Embedding 写入 PostgreSQL pgvector")
     pg_embed.add_argument("--force", action="store_true", help="重新生成全部向量")
+    memory_embed = sub.add_parser("memory-embed", help="为学生学习记忆和错题补全 pgvector 向量")
+    memory_embed.add_argument("--force", action="store_true", help="重新生成全部学生学习证据向量")
+    memory_maintain = sub.add_parser("memory-maintain", help="执行学习记忆衰减、过期和归档维护")
     practice_seed = sub.add_parser("practice-seed", help="为每个年级知识点生成并写入练习题库")
     pg_search = sub.add_parser("pg-search", help="从 PostgreSQL 知识库检索并返回来源依据")
     pg_search.add_argument("--query", required=True)
@@ -56,19 +59,26 @@ def main() -> None:
         from .pg_knowledge import database_url_from_env
         from .postgres_retrieval import PostgresHybridIndex
         from .reranker import cross_encoder_from_env
+        from .student_context import StudentContextRetriever
         try:
             config = DashScopeConfig.from_env()
+            database_url = database_url_from_env()
+            embedder = DashScopeEmbeddingService(config)
             index = PostgresHybridIndex(
-                database_url_from_env(), DashScopeEmbeddingService(config),
+                database_url, embedder,
                 reranker=cross_encoder_from_env(),
             )
-            rag = DashScopeRAGService(index, DashScopeChatService(config))
+            memory = PostgresMemoryStore(database_url, context_embedder=embedder)
+            rag = DashScopeRAGService(
+                index, DashScopeChatService(config),
+                student_context_retriever=StudentContextRetriever(
+                    memory, embedder=embedder, reranker=index.reranker,
+                ),
+            )
         except (DashScopeError, RuntimeError, ValueError) as exc:
             parser.error(str(exc))
-        database_url = database_url_from_env()
-        memory = PostgresMemoryStore(database_url)
         auth = PostgresAuthStore(database_url, secret_key=os.getenv("AUTH_SECRET_KEY") or None,
-                                  token_ttl_seconds=int(os.getenv("AUTH_TOKEN_TTL_SECONDS", "86400")))
+                                  token_ttl_seconds=int(os.getenv("AUTH_TOKEN_TTL_SECONDS", "604800")))
         checkpointer = PostgresCheckpointStore(database_url)
         practice = PostgresPracticeService(database_url, index.chunks)
         uvicorn.run(create_app(rag, memory=memory, auth=auth, checkpointer=checkpointer, practice=practice),
@@ -79,7 +89,7 @@ def main() -> None:
         from .pg_knowledge import database_url_from_env
         auth = PostgresAuthStore(
             database_url_from_env(), secret_key=os.getenv("AUTH_SECRET_KEY") or None,
-            token_ttl_seconds=int(os.getenv("AUTH_TOKEN_TTL_SECONDS", "86400")),
+            token_ttl_seconds=int(os.getenv("AUTH_TOKEN_TTL_SECONDS", "604800")),
         )
         items, _ = auth.list_users(search=args.username, limit=100)
         matches = [item for item in items if item["username"].lower() == args.username.lower()]
@@ -112,6 +122,18 @@ def main() -> None:
             dimensions=config.embedding_dimensions,
             batch_size=config.embedding_batch_size, force=args.force,
         ), ensure_ascii=False))
+    elif args.command == "memory-embed":
+        from .dashscope import DashScopeConfig, DashScopeEmbeddingService
+        from .pg_knowledge import database_url_from_env
+        from .pg_runtime import PostgresMemoryStore
+        config = DashScopeConfig.from_env()
+        store = PostgresMemoryStore(database_url_from_env(), context_embedder=DashScopeEmbeddingService(config))
+        print(json.dumps(store.sync_context_embeddings(force=args.force), ensure_ascii=False))
+    elif args.command == "memory-maintain":
+        from .memory import MemoryDecayService
+        from .pg_knowledge import database_url_from_env
+        from .pg_runtime import PostgresMemoryStore
+        print(json.dumps(MemoryDecayService(PostgresMemoryStore(database_url_from_env())).apply(), ensure_ascii=False))
     elif args.command == "practice-seed":
         from .pg_knowledge import database_url_from_env
         from .question_bank import seed_question_bank

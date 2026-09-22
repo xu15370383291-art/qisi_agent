@@ -72,6 +72,7 @@ class ChatResult:
     intent: str = "qa"
     retrieval_hits: list[RetrievalHit] = field(default_factory=list)
     source: str = "knowledge_base"
+    student_context: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -82,4 +83,5 @@ class ChatResult:
             "intent": self.intent,
             "source": self.source,
             "retrieval_hits": [item.to_dict() for item in self.retrieval_hits],
+            "student_context": self.student_context,
         }

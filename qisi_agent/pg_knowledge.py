@@ -101,7 +101,31 @@ CREATE INDEX IF NOT EXISTS knowledge_contents_version_idx
 CREATE INDEX IF NOT EXISTS knowledge_document_versions_document_created_idx
     ON public.knowledge_document_versions (document_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS ingestion_jobs_status_created_idx
-    ON public.ingestion_jobs (status, created_at DESC);
+  ON public.ingestion_jobs (status, created_at DESC);
+
+CREATE OR REPLACE VIEW public.admin_content_imports AS
+SELECT j.job_id,
+       j.status,
+       j.stage,
+       j.progress,
+       j.retry_count,
+       j.error_message,
+       j.created_by,
+       j.created_at,
+       j.started_at,
+       j.finished_at,
+       v.version_id,
+       v.document_id,
+       v.file_name,
+       v.file_hash,
+       v.status AS version_status,
+       d.document_name,
+       d.document_type,
+       d.grade_id,
+       d.grade_name
+FROM public.ingestion_jobs j
+JOIN public.knowledge_document_versions v USING (version_id)
+JOIN public.knowledge_documents d USING (document_id);
 
 CREATE OR REPLACE VIEW public.knowledge_point_search AS
 SELECT p.knowledge_point_id, p.point_name, p.ordinal,

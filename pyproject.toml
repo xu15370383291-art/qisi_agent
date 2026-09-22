@@ -29,4 +29,4 @@ addopts = "-q"
 include = ["qisi_agent*"]
 
 [tool.setuptools.data-files]
-"migrations" = ["migrations/001_runtime_schema.sql", "migrations/002_admin_activity.sql", "migrations/003_admin_directory_scope.sql"]
+"migrations" = ["migrations/001_runtime_schema.sql", "migrations/002_admin_activity.sql", "migrations/003_admin_directory_scope.sql", "migrations/004_knowledge_content_lineage.sql", "migrations/005_learning_memory_lifecycle.sql", "migrations/006_auth_token_lifecycle.sql"]

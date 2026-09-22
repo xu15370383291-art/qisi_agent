@@ -1,18 +1,27 @@
 import json
 from pathlib import Path
 
-from qisi_agent.agents import CheckpointStore, Supervisor
+import pytest
+
+from qisi_agent.agents import AgentState, CheckpointStore, Supervisor
 from qisi_agent.api import create_app
-from qisi_agent.auth import AuthError, AuthStore
+from qisi_agent.auth import AuthError, AuthStore, _unb64
 from qisi_agent.graph import KnowledgeGraph
 from qisi_agent.cloud_rag import DashScopeRAGService
+from qisi_agent.conversation import ConversationRouter, RouteDecision
 from qisi_agent.dashscope import DashScopeChatService, DashScopeConfig, DashScopeEmbeddingService
 from qisi_agent.embeddings import meaningful_overlap, tokenize
 from qisi_agent.ingestion import load_corpus
-from qisi_agent.memory import MemoryStore
+from qisi_agent.memory import LearningEventExtractor, MemoryConsolidator, MemoryDecayService, MemoryStore
 from qisi_agent.practice import PracticeService
 from qisi_agent.models import ChatResult, Chunk, Citation, RetrievalHit
+from qisi_agent.pg_knowledge import SCHEMA_SQL
+from qisi_agent.async_ingestion import (recover_stale_jobs, retry_document_job,
+                                        upload_document_id, validate_upload_payload)
 from qisi_agent.reranker import CrossEncoderReranker, PassthroughReranker, cross_encoder_from_env
+from qisi_agent.student_context import (StudentContextRetriever, _student_context_schema_sql,
+                                        memory_embedding_text, mistake_embedding_text)
+from qisi_agent.student_context import StudentContext
 
 
 ROOT = Path(__file__).parents[1]
@@ -99,6 +108,514 @@ def test_reranker_falls_back_when_model_load_fails(monkeypatch):
 
     monkeypatch.setattr("qisi_agent.reranker.CrossEncoderReranker", fail_to_load)
     assert isinstance(cross_encoder_from_env(), PassthroughReranker)
+
+
+def test_student_context_hybrid_retrieval_is_student_scoped_and_filters_old_states():
+    store = MemoryStore()
+    relevant = store.write("student-a", "解一元一次方程时移项符号总是写错",
+                           knowledge_point_id="一元一次方程", confidence=0.9, importance=0.9)
+    stale = store.write("student-a", "分数约分需要复习", knowledge_point_id="分数约分")
+    store.long_term[stale.memory_id].status = "superseded"
+    store.write("student-b", "解一元一次方程时移项符号总是写错",
+                knowledge_point_id="一元一次方程")
+    store.write_mistake("student-a", prompt="解方程 2(x-1)=6 时移项漏变号",
+                        explanation="移项后符号需要改变", knowledge_point_id="一元一次方程")
+    store.record_practice_result("student-a", "一元一次方程", False)
+
+    context = StudentContextRetriever(store).retrieve("student-a", "我解方程移项为什么总是符号错？")
+
+    assert context.memory_hits and context.memory_hits[0].chunk.chunk_id == relevant.memory_id
+    assert all(hit.chunk.metadata["student_id"] == "student-a" for hit in context.memory_hits)
+    assert stale.memory_id not in [hit.chunk.chunk_id for hit in context.memory_hits]
+    assert context.mistake_hits and context.mistake_hits[0].chunk.metadata["source_type"] == "student_mistake"
+    assert context.practice_evidence[0]["knowledge_point_id"] == "一元一次方程"
+
+
+def test_student_context_reranker_reorders_memory_candidates_after_hybrid_recall():
+    store = MemoryStore()
+    store.write("student", "学生对分数约分不熟悉", knowledge_point_id="分数约分")
+    target = store.write("student", "学生在一元一次方程移项时容易写错符号",
+                         knowledge_point_id="一元一次方程")
+
+    class ContextCrossEncoder:
+        def predict(self, pairs, **kwargs):
+            return [5.0 if "移项" in document else -5.0 for _, document in pairs]
+
+    reranker = CrossEncoderReranker("fixture-context", batch_size=2, model=ContextCrossEncoder())
+    context = StudentContextRetriever(store, reranker=reranker).retrieve("student", "方程怎么移项？")
+
+    assert context.memory_hits[0].chunk.chunk_id == target.memory_id
+    assert context.memory_hits[0].reranker_score > context.memory_hits[-1].reranker_score
+
+
+def test_student_context_embedding_schema_and_source_text_keep_evidence_types_separate():
+    schema = _student_context_schema_sql(8)
+    assert "learning_memory_embeddings" in schema and "learning_mistake_embeddings" in schema
+    assert "embedding vector(8)" in schema
+    memory_text = memory_embedding_text({"knowledge_point_id": "一元一次方程", "content": "移项易错", "status": "active"})
+    mistake_text = mistake_embedding_text({"knowledge_point_id": "一元一次方程", "prompt": "2x=4", "explanation": "两边同除 2"})
+    assert "类型：学习记忆" in memory_text and "类型：错题记录" in mistake_text
+
+
+def test_llm_learning_event_extraction_uses_validated_json_and_falls_back_safely():
+    class EventChat:
+        def complete(self, messages):
+            assert "只返回一个 JSON 对象" in messages[-1]["content"]
+            return type("Response", (), {"content": json.dumps({
+                "relevant": True, "content": "学生在一元一次方程移项时容易漏变号",
+                "memory_type": "difficulty_signal", "knowledge_point_id": "一元一次方程",
+                "claim": "needs_review", "confidence": 0.88, "importance": 0.82,
+            }, ensure_ascii=False)})()
+
+    event = LearningEventExtractor(EventChat()).extract("我解方程移项总是错")
+    assert event and event["extraction_method"] == "llm_json_schema"
+    assert event["semantic_key"] == "一元一次方程:difficulty_signal:needs_review"
+
+    class BadEventChat:
+        def complete(self, messages):
+            return type("Response", (), {"content": "不是 JSON"})()
+
+    fallback = LearningEventExtractor(BadEventChat()).extract("我不会分数约分")
+    assert fallback and fallback["extraction_method"] == "rule_fallback"
+
+
+def test_memory_consolidation_preserves_history_and_excludes_conflicts_from_recall():
+    store = MemoryStore()
+    merger = MemoryConsolidator(store)
+    old = merger.persist("student", {"content": "学生不会一元一次方程移项", "memory_type": "difficulty_signal",
+                                      "knowledge_point_id": "一元一次方程", "semantic_key": "eq:difficulty",
+                                      "confidence": .9, "importance": .8, "claim": "needs_review"}, source_message_id="m1")
+    new = merger.persist("student", {"content": "学生已能完成一元一次方程移项", "memory_type": "difficulty_signal",
+                                      "knowledge_point_id": "一元一次方程", "semantic_key": "eq:difficulty",
+                                      "confidence": .9, "importance": .8, "claim": "mastered"}, source_message_id="m2")
+    assert store.long_term[old.memory_id].status == "superseded"
+    assert new.status == "active" and new.supersedes_memory_id == old.memory_id
+    assert store.recall("student", "方程移项")[0].memory_id == new.memory_id
+    same = merger.persist("student", {"content": new.content, "memory_type": "difficulty_signal",
+                                       "knowledge_point_id": "一元一次方程", "semantic_key": "eq:difficulty",
+                                       "confidence": .9, "importance": .8}, source_message_id="m3")
+    assert same.memory_id == new.memory_id and same.version == 2
+    conflict = merger.persist("student", {"content": "学生明确表示方程移项已经完全掌握", "memory_type": "difficulty_signal",
+                                           "knowledge_point_id": "一元一次方程", "semantic_key": "eq:difficulty",
+                                           "confidence": .9, "importance": .8, "conflicts_with_prior": True}, source_message_id="m4")
+    assert conflict.status == "conflict"
+    assert conflict.memory_id not in [item.memory_id for item in store.recall("student", "方程移项")]
+
+
+def test_memory_decay_archives_old_signals_and_reactivates_when_reinforced():
+    store = MemoryStore()
+    item = store.write("student", "学生不会分数约分", memory_type="difficulty_signal",
+                       knowledge_point_id="分数约分", confidence=.9)
+    item.occurred_at = "2025-01-01T00:00:00+00:00"
+    result = MemoryDecayService(store).apply()
+    assert result["archived"] == 1 and item.status == "archived"
+    # An exact, newly observed signal is not a deletion reversal; it is a new
+    # reinforcement of the retained record and becomes retrievable again.
+    reactivated = MemoryConsolidator(store).persist("student", {
+        "content": "学生不会分数约分", "memory_type": "difficulty_signal", "knowledge_point_id": "分数约分",
+        "semantic_key": "fraction:difficulty", "confidence": .9, "importance": .8,
+    }, source_message_id="new-turn")
+    assert reactivated.memory_id == item.memory_id and reactivated.status == "updated"
+
+
+def test_learning_memory_lifecycle_migration_preserves_history_and_all_retrieval_states():
+    migration = (ROOT / "migrations" / "005_learning_memory_lifecycle.sql").read_text(encoding="utf-8")
+    assert "learning_memory_evidence" in migration
+    assert "student_knowledge_states" in migration
+    for state in ("superseded", "stale", "archived", "conflict"):
+        assert f"'{state}'" in migration
+
+
+def test_dual_rag_retrieves_and_injects_student_context_separately_from_course_evidence():
+    class ContextRetriever:
+        def __init__(self):
+            self.calls = []
+
+        def retrieve(self, student_id, query, *, top_k):
+            self.calls.append((student_id, query, top_k))
+            memory = RetrievalHit(Chunk("student-memory", "mem-1", "学生在移项时容易写错符号",
+                                        title="学习记忆", knowledge_point_ids=["一元一次方程"],
+                                        metadata={"source_type": "student_memory"}), 0.9)
+            mistake = RetrievalHit(Chunk("student-mistake", "mistake-1", "2(x-1)=6 的去括号步骤出错",
+                                         title="相关错题", knowledge_point_ids=["一元一次方程"],
+                                         metadata={"source_type": "student_mistake"}), 0.8)
+            return StudentContext([memory], [mistake], [{"knowledge_point_id": "一元一次方程", "mastery_status": "学习中"}])
+
+    context_retriever = ContextRetriever()
+    chunks = load_corpus(ROOT / "data" / "corpus")
+    service = DashScopeRAGService(_FixtureIndex(chunks), DashScopeChatService(
+        DashScopeConfig(api_key="test-key", embedding_dimensions=4), client=_FakeChatClient()),
+        student_context_retriever=context_retriever)
+
+    prepared = service.prepare_stream("为什么我总在一元一次方程移项时写错符号？", student_id="student-1")
+
+    prompt = prepared["messages"][-1]["content"]
+    assert context_retriever.calls == [("student-1", "为什么我总在一元一次方程移项时写错符号？", 5)]
+    assert "本地教材上下文" in prompt and "【学生学习背景】" in prompt and "【相关错题线索】" in prompt
+    assert "简短确认" in prepared["messages"][1]["content"]
+    assert prepared["student_context"]["memory_hits"][0]["chunk"]["metadata"]["source_type"] == "student_memory"
+    assert prepared["refused"] is False
+
+
+def test_personalized_question_refuses_to_guess_without_student_evidence():
+    class EmptyContextRetriever:
+        def retrieve(self, student_id, query, *, top_k):
+            return StudentContext()
+
+    chunks = load_corpus(ROOT / "data" / "corpus")
+    service = DashScopeRAGService(_FixtureIndex(chunks), DashScopeChatService(
+        DashScopeConfig(api_key="test-key", embedding_dimensions=4), client=_FakeChatClient()),
+        student_context_retriever=EmptyContextRetriever())
+
+    prepared = service.prepare_stream("为什么我总在一元一次方程移项时写错符号？", student_id="student-1")
+
+    assert prepared["refused"] is True
+    assert prepared["source"] == "insufficient_personal_evidence"
+    assert not prepared["messages"]
+
+
+def test_stream_exposes_concise_progress_before_answer_generation(tmp_path):
+    class StreamingRag:
+        index = _FixtureIndex([])
+
+        def prepare_stream(self, query, **kwargs):
+            return {"hits": [], "citations": [], "source": "hybrid", "prefix": "来源：教材\n",
+                    "confidence": 0.8, "refused": False, "student_context": {"memory_hits": []}}
+
+        def stream_prepared(self, prepared):
+            yield "这是根据依据整理的回答。"
+
+    from fastapi.testclient import TestClient
+    auth = AuthStore(tmp_path / "progress.sqlite3", secret_key="test-secret")
+    user = auth.register("progress_student", "secure-pass")
+    memory = MemoryStore()
+    client = TestClient(create_app(StreamingRag(), memory=memory, auth=auth))
+    response = client.post("/api/chat/stream", headers={"Authorization": f"Bearer {auth.issue_token(user)}"},
+                           json={"query": "一元一次方程怎么解？", "session_id": "progress-session"})
+
+    body = response.text
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "text/event-stream; charset=utf-8"
+    assert response.headers["cache-control"] == "no-cache"
+    assert response.headers["x-accel-buffering"] == "no"
+    assert response.content.decode("utf-8") == body
+    assert "这是根据依据整理的回答。" in body
+    assert "\ufffd" not in body
+    assert "event: progress" in body
+    assert "正在搜索课程资料和学习记录" in body
+    assert body.index("event: progress") < body.index("event: answer_delta")
+    assert "event: memory_hit" not in body and "event: retrieval" not in body
+    assert memory.get_messages("progress-session")[-1]["role"] == "assistant"
+
+    deferred_store = MemoryStore()
+    events = list(Supervisor(StreamingRag(), deferred_store).run_stream("student", "deferred", "一元一次方程怎么解？"))
+    types = [item["type"] for item in events]
+    assert types.index("done") < types.index("memory_update")
+    assert deferred_store.get_messages("deferred")[-1]["role"] == "assistant"
+
+
+def test_follow_up_receives_prior_answer_and_completed_answer_is_saved_before_done():
+    class FollowUpRag:
+        index = _FixtureIndex([])
+
+        def __init__(self):
+            self.histories = []
+
+        def prepare_stream(self, query, *, conversation_history=None, **kwargs):
+            self.histories.append(list(conversation_history or []))
+            return {"hits": [], "citations": [], "source": "hybrid", "prefix": "",
+                    "confidence": .8, "refused": False, "student_context": {"memory_hits": []}}
+
+        def stream_prepared(self, prepared):
+            yield "我可以画图或出一道小练习帮你巩固。"
+
+    store = MemoryStore()
+    rag = FollowUpRag()
+    supervisor = Supervisor(rag, store)
+    list(supervisor.run_stream("student", "follow-up", "请解释移项"))
+    assert [(item["role"], item["content"]) for item in store.get_messages("follow-up")] == [
+        ("user", "请解释移项"), ("assistant", "我可以画图或出一道小练习帮你巩固。"),
+    ]
+    list(supervisor.run_stream("student", "follow-up", "可以"))
+    assert rag.histories[1][-1]["role"] == "assistant"
+    assert rag.histories[1][-1]["content"] == "我可以画图或出一道小练习帮你巩固。"
+
+
+def test_postgres_conversation_uses_message_id_for_stable_fast_turn_order(monkeypatch):
+    """A timestamp tie must not place the assistant reply ahead of its question."""
+    from qisi_agent.pg_runtime import PostgresMemoryStore
+    import qisi_agent.pg_runtime as pg_runtime
+
+    captured = {}
+
+    class Cursor:
+        def fetchall(self):
+            # PostgreSQL returns the newest message first for the query below.
+            return [
+                ("assistant", "第二个回答", "2026-09-21T10:00:00"),
+                ("user", "第二个问题", "2026-09-21T10:00:00"),
+                ("assistant", "第一个回答", "2026-09-21T10:00:00"),
+                ("user", "第一个问题", "2026-09-21T10:00:00"),
+            ]
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params):
+            captured["sql"], captured["params"] = sql, params
+            return Cursor()
+
+    class Psycopg:
+        @staticmethod
+        def connect(_url):
+            return Connection()
+
+    monkeypatch.setattr(pg_runtime, "psycopg", Psycopg())
+    store = PostgresMemoryStore.__new__(PostgresMemoryStore)
+    store.database_url = "postgresql://fixture"
+
+    assert [(item["role"], item["content"]) for item in store.get_messages("fast-turns")] == [
+        ("user", "第一个问题"), ("assistant", "第一个回答"),
+        ("user", "第二个问题"), ("assistant", "第二个回答"),
+    ]
+    assert "ORDER BY message_id DESC" in captured["sql"]
+    assert captured["params"] == ("fast-turns",)
+
+
+def test_checkpoint_preserves_structured_pending_action_for_a_session():
+    checkpoint = CheckpointStore()
+    action = {
+        "type": "practice_offer",
+        "status": "pending",
+        "topic": "平行线模型",
+        "resolved_request": "围绕平行线模型出三道练习题并解析。",
+        "expires_after_turns": 2,
+    }
+    checkpoint.save("pending-session", AgentState(
+        "student", "pending-session", "什么是平行线模型？",
+        pending_action=action,
+    ))
+
+    restored = checkpoint.load("pending-session")
+    assert restored["pending_action"] == action
+    assert restored["resolved_request"] == ""
+
+
+def test_postgres_checkpoint_serializes_pending_action_as_session_state(monkeypatch):
+    import qisi_agent.pg_runtime as pg_runtime
+    from qisi_agent.pg_runtime import PostgresCheckpointStore
+
+    captured = {}
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params):
+            captured["sql"], captured["params"] = sql, params
+
+    class Psycopg:
+        @staticmethod
+        def connect(_url):
+            return Connection()
+
+    monkeypatch.setattr(pg_runtime, "psycopg", Psycopg())
+    store = PostgresCheckpointStore.__new__(PostgresCheckpointStore)
+    store.database_url = "postgresql://fixture"
+    store.save("postgres-pending", AgentState(
+        "student", "postgres-pending", "需要", pending_action={
+            "type": "practice_offer", "status": "pending", "topic": "平行线模型",
+        },
+    ))
+
+    payload = json.loads(captured["params"][1])
+    assert "agent_checkpoints" in captured["sql"]
+    assert payload["pending_action"]["topic"] == "平行线模型"
+
+
+def test_conversation_router_resolves_acceptance_before_retrieval():
+    class RouterChat:
+        def complete(self, _messages):
+            return type("Response", (), {"content": json.dumps({
+                "relation": "accept", "confidence": 0.98,
+                "resolved_request": "围绕平行线模型出三道由浅入深的练习题并解析。",
+                "reason": "用户接受上一轮出题提议",
+            }, ensure_ascii=False)})()
+
+    router = ConversationRouter(RouterChat())
+    history = [
+        {"role": "user", "content": "什么是平行线模型？"},
+        {"role": "assistant", "content": "我可以围绕平行线模型出三道题，你需要吗？"},
+    ]
+    pending = {
+        "type": "practice_offer", "status": "pending", "topic": "平行线模型",
+        "resolved_request": "围绕平行线模型出三道由浅入深的练习题并解析。",
+        "created_at_user_turn": 1, "expires_after_turns": 2,
+    }
+
+    decision = router.decide(history, pending, "需要")
+
+    assert decision.relation == "accept"
+    assert decision.resolved_request.startswith("围绕平行线模型")
+    assert "一元一次方程" not in decision.resolved_request
+
+
+def test_conversation_router_extracts_structured_pending_practice_action():
+    class ExtractorChat:
+        def complete(self, _messages):
+            return type("Response", (), {"content": json.dumps({"pending_action": {
+                "type": "practice_offer", "proposal": "出三道平行线模型练习题",
+                "topic": "平行线模型",
+                "resolved_request": "围绕平行线模型出三道由浅入深的练习题并解析。",
+                "options": [],
+            }}, ensure_ascii=False)})()
+
+    action = ConversationRouter(ExtractorChat()).extract_pending_action(
+        history=[], user_request="什么是平行线模型？",
+        assistant_answer="平行线模型可以这样理解。需要我出三道练习题吗？",
+        grade_id="grade7", course_id="math", knowledge_point_ids=["平行线判定"],
+    )
+
+    assert action["status"] == "pending"
+    assert action["type"] == "practice_offer"
+    assert action["knowledge_point_ids"] == ["平行线判定"]
+    assert action["resolved_request"].startswith("围绕平行线模型")
+
+
+def test_conversation_router_requires_clarification_for_unselected_multiple_options():
+    class OverconfidentRouterChat:
+        def complete(self, _messages):
+            return type("Response", (), {"content": json.dumps({
+                "relation": "accept", "confidence": 0.99,
+                "resolved_request": "继续刚才的讲解。",
+            }, ensure_ascii=False)})()
+
+    decision = ConversationRouter(OverconfidentRouterChat()).decide(
+        [{"role": "user", "content": "什么是平行线模型？"}],
+        {
+            "type": "followup_offer", "status": "pending", "created_at_user_turn": 1,
+            "expires_after_turns": 2, "resolved_request": "继续讲解平行线模型。",
+            "options": ["代码示例", "架构图"],
+        },
+        "需要",
+    )
+
+    assert decision.relation == "ambiguous"
+    assert decision.reason == "unselected_multiple_options"
+
+
+def test_router_failure_with_pending_action_fails_safe_without_retrieval():
+    pending = {
+        "type": "practice_offer", "status": "pending", "created_at_user_turn": 1,
+        "expires_after_turns": 2, "resolved_request": "围绕平行线模型出题。",
+    }
+    decision = ConversationRouter().decide(
+        [{"role": "user", "content": "什么是平行线模型？"}], pending, "需要",
+    )
+
+    assert decision.relation == "ambiguous"
+    assert decision.reason == "router_unavailable"
+
+
+def test_pending_acceptance_uses_resolved_topic_for_rag_not_raw_confirmation():
+    class RoutedRag:
+        index = _FixtureIndex([])
+
+        def __init__(self):
+            self.queries = []
+
+        def prepare_stream(self, query, **kwargs):
+            self.queries.append((query, kwargs.get("conversation_history")))
+            return {"hits": [], "citations": [], "source": "hybrid", "prefix": "",
+                    "confidence": 0.9, "refused": False, "student_context": {"memory_hits": []}}
+
+        def stream_prepared(self, _prepared):
+            yield "第 1 题：请根据同位角相等判断两直线平行。"
+
+    class PendingRouter:
+        def active_pending_action(self, pending_action, _history):
+            return pending_action
+
+        def decide(self, _history, _pending_action, user_message):
+            assert user_message == "需要"
+            return RouteDecision("accept", 0.99, "围绕平行线模型出三道由浅入深的练习题并解析。")
+
+        def extract_pending_action(self, **_kwargs):
+            return None
+
+    memory = MemoryStore()
+    memory.append_message("parallel-session", "user", "什么是平行线模型？")
+    memory.append_message("parallel-session", "assistant", "平行线模型可以这样理解。需要我出题吗？")
+    checkpoint = CheckpointStore()
+    checkpoint.save("parallel-session", AgentState(
+        "student", "parallel-session", "什么是平行线模型？", pending_action={
+            "type": "practice_offer", "status": "pending", "topic": "平行线模型",
+            "resolved_request": "围绕平行线模型出三道由浅入深的练习题并解析。",
+            "created_at_user_turn": 1, "expires_after_turns": 2,
+        },
+    ))
+    rag = RoutedRag()
+    events = list(Supervisor(rag, memory, checkpoint, conversation_router=PendingRouter()).run_stream(
+        "student", "parallel-session", "需要", course_id="math", grade_id="grade7",
+    ))
+
+    assert rag.queries[0][0] == "围绕平行线模型出三道由浅入深的练习题并解析。"
+    assert rag.queries[0][0] != "需要"
+    assert "一元一次方程" not in rag.queries[0][0]
+    assert memory.get_messages("parallel-session")[-2]["content"] == "需要"
+    assert "同位角" in memory.get_messages("parallel-session")[-1]["content"]
+    assert checkpoint.load("parallel-session")["pending_action"] is None
+    assert events[-2]["type"] == "done"
+
+
+def test_streamed_answer_persists_model_extracted_pending_action():
+    class StateExtractorChat:
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, _messages):
+            self.calls += 1
+            return type("Response", (), {"content": json.dumps({"pending_action": {
+                "type": "practice_offer", "proposal": "出三道平行线模型练习题",
+                "topic": "平行线模型",
+                "resolved_request": "围绕平行线模型出三道由浅入深的练习题并解析。",
+                "options": [],
+            }}, ensure_ascii=False)})()
+
+    class OfferRag:
+        index = _FixtureIndex([])
+
+        def __init__(self):
+            self.chat = StateExtractorChat()
+
+        def prepare_stream(self, _query, **_kwargs):
+            return {"hits": [], "citations": [], "source": "hybrid", "prefix": "",
+                    "confidence": 0.9, "refused": False, "student_context": {"memory_hits": []}}
+
+        def stream_prepared(self, _prepared):
+            yield "平行线模型的关键是利用角的关系。需要我出三道练习题吗？"
+
+    checkpoint = CheckpointStore()
+    rag = OfferRag()
+    events = list(Supervisor(rag, MemoryStore(), checkpoint).run_stream(
+        "student", "offer-session", "什么是平行线模型？", course_id="math", grade_id="grade7",
+    ))
+
+    pending = checkpoint.load("offer-session")["pending_action"]
+    # A short first question is classified once, then the finished answer is
+    # inspected once for a structured follow-up action.
+    assert rag.chat.calls == 2
+    assert pending["status"] == "pending"
+    assert pending["topic"] == "平行线模型"
+    assert pending["created_at_user_turn"] == 1
+    assert any(item["type"] == "progress" and item["message"] == "正在准备下一步学习" for item in events)
 
 
 def test_question_bank_preserves_options_and_answer(tmp_path):
@@ -290,6 +807,45 @@ def test_auth_registration_tokens_and_user_isolation(tmp_path):
     assert client.get("/api/teacher/overview", headers=headers).status_code == 403
 
 
+def test_role_based_jwt_lifetimes_and_account_security_actions(tmp_path):
+    import time
+    auth = AuthStore(tmp_path / "token-policy.sqlite3", secret_key="test-secret")
+    student = auth.register("token_student", "secure-pass")
+    teacher = auth.register("token_teacher", "secure-pass", role="teacher")
+    admin = auth.register_admin("token_admin", "secure-pass", application_code="code", expected_code="code")
+
+    def claims(token):
+        return json.loads(_unb64(token.split(".")[1]))
+
+    assert claims(auth.issue_token(student, remember_me=True))["exp"] - int(time.time()) <= 7 * 24 * 3600
+    assert claims(auth.issue_token(student))["exp"] - int(time.time()) <= 8 * 3600
+    assert claims(auth.issue_token(teacher, remember_me=True))["exp"] - int(time.time()) <= 8 * 3600
+    assert claims(auth.issue_token(admin, remember_me=True))["exp"] - int(time.time()) <= 2 * 3600
+
+    old = auth.issue_token(student)
+    auth.change_password(student.user_id, "secure-pass", "changed-pass")
+    with pytest.raises(AuthError):
+        auth.user_from_token(old)
+    fresh = auth.issue_token(auth.authenticate("token_student", "changed-pass"))
+    auth.revoke_all_tokens(student.user_id)
+    with pytest.raises(AuthError):
+        auth.user_from_token(fresh)
+
+
+def test_login_remember_me_is_student_only_and_failures_are_limited(tmp_path):
+    auth = AuthStore(tmp_path / "login-policy.sqlite3", secret_key="test-secret")
+    student = auth.register("login_student", "secure-pass")
+    auth.register("login_teacher", "secure-pass", role="teacher")
+    client = __import__("fastapi.testclient", fromlist=["TestClient"]).TestClient(create_app(make_rag(), auth=auth))
+    student_login = client.post("/api/auth/login", json={"username": "login_student", "password": "secure-pass", "role": "student", "remember_me": True})
+    assert student_login.status_code == 200 and student_login.json()["persistent_login"] is True
+    teacher_login = client.post("/api/auth/login", json={"username": "login_teacher", "password": "secure-pass", "role": "teacher", "remember_me": True})
+    assert teacher_login.status_code == 200 and teacher_login.json()["persistent_login"] is False
+    for _ in range(5):
+        assert client.post("/api/auth/login", json={"username": "login_student", "password": "wrong-pass", "role": "student"}).status_code == 401
+    assert client.post("/api/auth/login", json={"username": "login_student", "password": "wrong-pass", "role": "student"}).status_code == 429
+
+
 def test_auth_roles_are_explicit(tmp_path):
     from fastapi.testclient import TestClient
 
@@ -322,6 +878,127 @@ def test_structured_question_bank_ingestion(tmp_path):
     assert chunks[0].metadata["question_id"] == "q-1"
     assert "答案：x=2" in chunks[0].text
     assert chunks[0].knowledge_point_ids == ["一元一次方程"]
+
+
+def test_content_import_view_is_part_of_postgres_schema():
+    required_fragments = (
+        "CREATE OR REPLACE VIEW public.admin_content_imports",
+        "FROM public.ingestion_jobs j",
+        "JOIN public.knowledge_document_versions v USING (version_id)",
+        "JOIN public.knowledge_documents d USING (document_id)",
+        "j.retry_count",
+        "v.status AS version_status",
+    )
+    assert all(fragment in SCHEMA_SQL for fragment in required_fragments)
+
+
+def test_failed_content_import_can_be_requeued(monkeypatch, tmp_path):
+    source = tmp_path / "教材.md"
+    source.write_text("# 一元一次方程\n", encoding="utf-8")
+
+    class FakeCursor:
+        def __init__(self):
+            self.result = ("failed", "version-1", "document-1", str(source))
+            self.updated = ("job-1", 2)
+            self.statements = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, statement, params=()):
+            self.statements.append((statement, params))
+            if "RETURNING job_id, retry_count" in statement:
+                self.result = self.updated
+
+        def fetchone(self):
+            result, self.result = self.result, None
+            return result
+
+    class FakeConnection:
+        def __init__(self):
+            self.cursor_instance = FakeCursor()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def cursor(self):
+            return self.cursor_instance
+
+    connection = FakeConnection()
+    monkeypatch.setattr("qisi_agent.async_ingestion.psycopg.connect", lambda database_url: connection)
+
+    result = retry_document_job("fixture-db", "job-1")
+
+    assert result == {"job_id": "job-1", "status": "queued", "retry_count": 2}
+    statements = "\n".join(statement for statement, _ in connection.cursor_instance.statements)
+    assert "retry_count=retry_count+1" in statements
+    assert "UPDATE knowledge_document_versions" in statements
+    assert "UPDATE knowledge_documents" in statements
+
+
+def test_uploaded_document_id_is_stable_for_new_versions():
+    first = upload_document_id("七年级数学.md", "grade7")
+    second = upload_document_id("七年级数学.md", "grade7")
+    other_grade = upload_document_id("七年级数学.md", "grade8")
+    assert first == second
+    assert first != other_grade
+    assert first.startswith("doc_")
+
+
+def test_upload_validation_rejects_bad_structured_content():
+    assert validate_upload_payload("../教材.md", "# 章节\n内容".encode("utf-8")) == "教材.md"
+    with pytest.raises(ValueError, match="有效的 JSON"):
+        validate_upload_payload("题库.json", b"{not-json}")
+    with pytest.raises(ValueError, match="空白文件"):
+        validate_upload_payload("教材.txt", b" \n")
+    with pytest.raises(ValueError, match="支持"):
+        validate_upload_payload("教材.exe", b"data")
+
+
+def test_stale_imports_are_marked_failed(monkeypatch):
+    class FakeCursor:
+        def __init__(self):
+            self.statements = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, statement, params=()):
+            self.statements.append((statement, params))
+
+        def fetchall(self):
+            return [("job-timeout",)]
+
+    class FakeConnection:
+        def __init__(self):
+            self.cursor_instance = FakeCursor()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def cursor(self):
+            return self.cursor_instance
+
+    connection = FakeConnection()
+    monkeypatch.setattr("qisi_agent.async_ingestion.psycopg.connect", lambda database_url: connection)
+
+    assert recover_stale_jobs("fixture-db", 60) == 1
+    statements = "\n".join(statement for statement, _ in connection.cursor_instance.statements)
+    assert "started_at < NOW()" in statements
+    assert "stage='timeout'" in statements
+    assert "UPDATE knowledge_document_versions" in statements
 
 
 def test_graph_expansion():
